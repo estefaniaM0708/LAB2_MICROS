@@ -1,0 +1,204 @@
+#include <Keypad.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+
+// Configuración de Pantalla LCD I2C (Dirección 0x27, 16x2)
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// Configuración del Teclado Matricial 4x4
+const byte FILAS = 4;
+const byte COLUMNAS = 4;
+
+char teclas[FILAS][COLUMNAS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte pinesFilas[FILAS]       = {13, 12, 14, 27};
+byte pinesColumnas[COLUMNAS] = {19, 18, 5, 17};
+
+Keypad teclado = Keypad(makeKeymap(teclas), pinesFilas, pinesColumnas, FILAS, COLUMNAS);
+
+// Asignación de Pines ESP32
+const int PIN_ADC = 35;        // Entrada analógica desde el LM331N
+const int PIN_DAC = 25;        // Salida DAC hacia Ánodo del 4N25
+const int PIN_ENCODER_A = 32;  // Canal A del encoder
+const int PIN_ENCODER_B = 26;  // Canal B del encoder
+
+// Parámetros de Calibración Analógica
+float PENDIENTE_RPM = 769.0;   // Ajustado con tus mediciones
+float INTERCEPTO_RPM = -153.0; // Offset corregido
+
+// Límites Operativos
+const float RPM_MIN = 0.0;
+const float RPM_MAX = 3000.0;
+
+// Variables de Estado
+float rpmMedida = 0;
+float rpmDeseada = 0;
+float rpmPromedio = 0;
+String bufferEntrada = "";
+
+// Controlador PI
+float kp = 0.25;
+float ki = 0.02;
+float errorAcumulado = 0.0;
+float salidaDAC = 0.0;
+
+// Duty mínimo y máximo
+const int DUTY_MIN = 40;
+const int DUTY_MAX = 255;
+
+// Control de Tiempo
+unsigned long tUltimaLectura = 0;
+const unsigned long PERIODO_LECTURA_MS = 200;
+unsigned long tiempoArranque = 0;
+bool faseArranque = true;
+
+// Filtro de Promedio Móvil
+const int NUM_MUESTRAS = 10;
+float muestras[NUM_MUESTRAS];
+int indiceMuestra = 0;
+
+void setup() {
+  dacWrite(PIN_DAC, 0);
+  Serial.begin(115200);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Control RPM ESP32");
+  lcd.setCursor(0, 1);
+  lcd.print("Ingrese RPM: #");
+  delay(1500);
+  lcd.clear();
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PIN_ADC, ADC_11db);
+
+  pinMode(PIN_ENCODER_A, INPUT);
+  pinMode(PIN_ENCODER_B, INPUT);
+}
+
+void loop() {
+  char tecla = teclado.getKey();
+  if (tecla) manejarTecla(tecla);
+
+  if (millis() - tUltimaLectura >= PERIODO_LECTURA_MS) {
+    tUltimaLectura = millis();
+    leerVelocidad();
+    aplicarControl();
+    leerDireccion();
+    actualizarLCD();
+  }
+}
+
+void manejarTecla(char tecla) {
+  if (tecla >= '0' && tecla <= '9') {
+    bufferEntrada += tecla;
+  } else if (tecla == '#') {
+    if (bufferEntrada.length() > 0) {
+      float valor = bufferEntrada.toFloat();
+      rpmDeseada = constrain(valor, RPM_MIN, RPM_MAX);
+      errorAcumulado = 0.0;
+      bufferEntrada = "";
+      tiempoArranque = millis();
+      faseArranque = true;
+    }
+  } else if (tecla == '*') {
+    bufferEntrada = "";
+  }
+}
+
+void leerVelocidad() {
+  int lecturaCruda = analogRead(PIN_ADC);
+  if (lecturaCruda < 100) lecturaCruda = 0;
+
+  float voltaje = (lecturaCruda / 4095.0) * 3.3;
+  rpmMedida = (lecturaCruda == 0) ? 0.0 : PENDIENTE_RPM * voltaje + INTERCEPTO_RPM;
+  rpmMedida = constrain(rpmMedida, 0, RPM_MAX);
+
+  muestras[indiceMuestra] = rpmMedida;
+  indiceMuestra = (indiceMuestra + 1) % NUM_MUESTRAS;
+
+  float suma = 0;
+  for (int i = 0; i < NUM_MUESTRAS; i++) suma += muestras[i];
+  rpmPromedio = suma / NUM_MUESTRAS;
+
+  Serial.print("ADC: ");
+  Serial.print(lecturaCruda);
+  Serial.print(" | Volt: ");
+  Serial.print(voltaje, 2);
+  Serial.print("V | RPM Med: ");
+  Serial.print((int)rpmPromedio);
+  Serial.print(" | RPM Des: ");
+  Serial.println((int)rpmDeseada);
+}
+
+void aplicarControl() {
+  if (rpmDeseada <= 10.0) {
+    salidaDAC = 0;
+    errorAcumulado = 0;
+    dacWrite(PIN_DAC, 0);
+    return;
+  }
+
+  float error = rpmDeseada - rpmPromedio;
+  float dt = PERIODO_LECTURA_MS / 1000.0;
+
+  errorAcumulado += error * dt;
+  errorAcumulado = constrain(errorAcumulado, -500.0, 500.0);
+
+  // Offset dinámico según consigna
+  float OFFSET_DAC = (rpmDeseada < 600) ? 130.0 : 110.0;
+  float control = (kp * error) + (ki * errorAcumulado);
+
+  salidaDAC = (control > 0) ? OFFSET_DAC + control : 0;
+
+  // Impulso de arranque
+  if (faseArranque && rpmPromedio < 400.0 && (millis() - tiempoArranque < 2000)) {
+    salidaDAC = 200;
+  } else {
+    faseArranque = false;
+  }
+
+  // Histeresis: evita que el motor se apague
+  if (rpmPromedio > 200.0 && rpmDeseada > 0 && salidaDAC < 80) {
+    salidaDAC = 80;
+  }
+
+  // Duty mínimo dinámico
+  int dutyMinimo = DUTY_MIN;
+  if (rpmDeseada < 600.0) dutyMinimo = 100;
+
+  if (rpmDeseada > 0 && salidaDAC < dutyMinimo) salidaDAC = dutyMinimo;
+  salidaDAC = constrain(salidaDAC, 0.0, DUTY_MAX);
+
+  dacWrite(PIN_DAC, (int)salidaDAC);
+}
+
+void actualizarLCD() {
+  lcd.setCursor(0, 0);
+  lcd.print("RPM Act: ");
+  lcd.print((int)rpmPromedio);
+  lcd.print("   ");
+
+  lcd.setCursor(0, 1);
+  if (bufferEntrada.length() > 0) {
+    lcd.print("Set: ");
+    lcd.print(bufferEntrada);
+    lcd.print(" RPM   ");
+  } else {
+    lcd.print("Des: ");
+    lcd.print((int)rpmDeseada);
+    lcd.print(" RPM   ");
+  }
+}
+
+void leerDireccion() {
+  int estadoA = digitalRead(PIN_ENCODER_A);
+  int estadoB = digitalRead(PIN_ENCODER_B);
+  Serial.println((estadoA == estadoB) ? "Direccion: Horario" : "Direccion: Antihorario");
+}
