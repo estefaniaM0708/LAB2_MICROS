@@ -1,7 +1,4 @@
 # LAB2_MICROS
-Entendido. El problema era que incluí bloques separados y referencias externas. A continuación está **un único bloque Markdown completo**, listo para copiar directamente en tu `README.md`.
-
-````markdown
 # Comparación MicroPython vs Arduino IDE
 
 ## Sistema de control de velocidad con ESP32
